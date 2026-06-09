@@ -14,6 +14,17 @@
 import os
 # 关闭 transformers 并行异步权重加载，降低 Windows 下 mmap 瞬时提交峰值
 os.environ.setdefault("HF_DEACTIVATE_ASYNC_LOAD", "1")
+# Windows 下 eval 阶段 torch.compile/inductor 易崩溃，直接关闭
+os.environ.setdefault("TORCHDYNAMO_DISABLE", "1")
+os.environ.setdefault("UNSLOTH_COMPILE_DISABLE", "1")
+
+# 把 torch.compile / triton 的缓存目录指到纯英文路径，
+# 规避中文用户名（C:\Users\刘鹏\...\torchinductor_刘鹏）导致的编译/解码报错
+_CACHE_ROOT = r"D:\llm_cache"
+os.makedirs(os.path.join(_CACHE_ROOT, "inductor"), exist_ok=True)
+os.makedirs(os.path.join(_CACHE_ROOT, "triton"), exist_ok=True)
+os.environ.setdefault("TORCHINDUCTOR_CACHE_DIR", os.path.join(_CACHE_ROOT, "inductor"))
+os.environ.setdefault("TRITON_CACHE_DIR", os.path.join(_CACHE_ROOT, "triton"))
 
 import unsloth  # noqa: F401  (必须最先导入以应用补丁)
 from unsloth import FastLanguageModel
@@ -68,6 +79,7 @@ GRAD_ACCUM          = 8        # 等效 batch = 8
 # 防遗忘要点4：NEFTune 给嵌入加噪声，提升泛化、降低过拟合
 NEFTUNE_ALPHA       = 5
 SEED                = 3407
+VAL_RATIO           = 0.10     # 留 10% 作验证集，训练中跟踪 eval_loss
 
 SYSTEM_PROMPT = (
     "你是联邦学习与分布式机器学习领域的专业研究员，"
@@ -160,21 +172,31 @@ def main():
         loftq_config               = None,
     )
 
-    # ── 3. 构建数据集 ───────────────────────────────────────────────
+    # ── 3. 构建数据集（划分训练/验证集）──────────────────────────────
     print(f"\n加载训练集：{TRAIN_FILE}", flush=True)
     samples = load_jsonl(TRAIN_FILE)
     print(f"  共 {len(samples)} 条原始样本", flush=True)
-    train_dataset = build_dataset(tokenizer, samples)
+    full_dataset = build_dataset(tokenizer, samples)
+    # 留出 10% 作验证集，训练时跟踪 eval_loss，量化监控过拟合/遗忘
+    split = full_dataset.train_test_split(test_size=VAL_RATIO, seed=SEED)
+    train_dataset, eval_dataset = split["train"], split["test"]
+    print(f"  训练集 {len(train_dataset)} 条 | 验证集 {len(eval_dataset)} 条", flush=True)
+
+    # 验证集评估频率：每 EVAL_EVERY 个优化步评估一次
+    steps_per_epoch = max(1, len(train_dataset) // (BATCH_SIZE * GRAD_ACCUM))
+    eval_steps = max(1, steps_per_epoch // 2)
 
     # ── 4. 配置 Trainer ─────────────────────────────────────────────
     trainer = SFTTrainer(
         model           = model,
         tokenizer       = tokenizer,
         train_dataset   = train_dataset,
+        eval_dataset    = eval_dataset,
         args = SFTConfig(
             dataset_text_field          = "text",
             max_seq_length              = MAX_SEQ_LENGTH,
             per_device_train_batch_size = BATCH_SIZE,
+            per_device_eval_batch_size  = BATCH_SIZE,
             gradient_accumulation_steps = GRAD_ACCUM,
             warmup_ratio                = WARMUP_RATIO,
             num_train_epochs            = NUM_EPOCHS,
@@ -184,6 +206,8 @@ def main():
             optim                       = "adamw_8bit",
             neftune_noise_alpha         = NEFTUNE_ALPHA,
             logging_steps               = 1,
+            eval_strategy               = "steps",
+            eval_steps                  = eval_steps,
             seed                        = SEED,
             output_dir                  = OUTPUT_DIR,
             save_strategy               = "no",
@@ -216,6 +240,21 @@ def main():
     model.save_pretrained(FINAL_DIR)
     tokenizer.save_pretrained(FINAL_DIR)
     print(f"LoRA 权重已保存到：{FINAL_DIR}", flush=True)
+
+    # ── 7.1 保存 train/eval loss 曲线（供可视化看板使用）──────────────
+    history = []
+    for rec in trainer.state.log_history:
+        if "loss" in rec or "eval_loss" in rec:
+            history.append({
+                "step":      rec.get("step"),
+                "epoch":     rec.get("epoch"),
+                "loss":      rec.get("loss"),
+                "eval_loss": rec.get("eval_loss"),
+            })
+    loss_path = os.path.join(OUTPUT_DIR, "loss_history.json")
+    with open(loss_path, "w", encoding="utf-8") as f:
+        json.dump(history, f, ensure_ascii=False, indent=2)
+    print(f"loss 曲线已保存到：{loss_path}", flush=True)
 
     # ── 8. 可选：训练后推理对比 ─────────────────────────────────────
     if args.eval:

@@ -1,0 +1,27 @@
+﻿# Python caches
+__pycache__/
+*.py[cod]
+
+# Runtime logs and chats
+*.log
+chat_logs/
+
+# Generated training caches
+unsloth_compiled_cache/
+*/unsloth_compiled_cache/
+
+# Model weights and generated artifacts
+*.safetensors
+*.bin
+qwen3.5-2b/unsloth_output/
+
+# Local marker files
+qwen3.5-2b/.msc
+qwen3.5-2b/.mv
+
+# Tokenizer/model artifact files not needed for source release
+qwen3.5-2b/tokenizer.json
+qwen3.5-2b/tokenizer_config.json
+qwen3.5-2b/vocab.json
+qwen3.5-2b/merges.txt
+qwen3.5-2b/model.safetensors.index.json
