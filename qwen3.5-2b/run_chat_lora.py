@@ -28,7 +28,9 @@ import torch
 from peft import PeftModel
 
 MODEL_DIR = r"D:\LLM\models\qwen3.5-2b"
-LORA_DIR  = r"D:\LLM\models\qwen3.5-2b\unsloth_output\final"
+OUTPUT_DIR = r"D:\LLM\models\qwen3.5-2b\unsloth_output"
+DEFAULT_LORA_DIR = os.path.join(OUTPUT_DIR, "final")
+LATEST_LORA_FILE = os.path.join(OUTPUT_DIR, "latest_lora_dir.txt")
 LOG_DIR   = r"D:\LLM\models\qwen3.5-2b\chat_logs"
 LOG_FILE  = os.path.join(LOG_DIR, "chat_history_lora.txt")
 MODEL_TAG = "微调后(LoRA)"
@@ -40,11 +42,23 @@ SYSTEM_PROMPT = (
 )
 
 
+def resolve_lora_dir() -> str:
+    env_dir = os.environ.get("LORA_DIR")
+    if env_dir:
+        return env_dir
+    if os.path.isfile(LATEST_LORA_FILE):
+        latest = open(LATEST_LORA_FILE, "r", encoding="utf-8").read().strip()
+        if latest:
+            return latest
+    return DEFAULT_LORA_DIR
+
+
 def load_model():
+    lora_dir = resolve_lora_dir()
     if not torch.cuda.is_available():
         sys.exit("无 CUDA，请检查 GPU 与 PyTorch。")
-    if not os.path.isdir(LORA_DIR):
-        sys.exit(f"未找到 LoRA 权重目录：{LORA_DIR}\n请先运行 unsloth_train.py 完成微调。")
+    if not os.path.isdir(lora_dir):
+        sys.exit(f"未找到 LoRA 权重目录：{lora_dir}\n请先运行 unsloth_train.py 完成微调。")
 
     print("加载基础模型（4-bit）...", flush=True)
     model, tok = FastLanguageModel.from_pretrained(
@@ -54,8 +68,8 @@ def load_model():
         load_in_4bit    = True,
         full_finetuning = False,
     )
-    print(f"挂载 LoRA 适配器：{LORA_DIR}", flush=True)
-    model = PeftModel.from_pretrained(model, LORA_DIR)
+    print(f"挂载 LoRA 适配器：{lora_dir}", flush=True)
+    model = PeftModel.from_pretrained(model, lora_dir)
     FastLanguageModel.for_inference(model)
     model.eval()
 
@@ -66,11 +80,12 @@ def load_model():
 
 
 def init_log():
+    lora_dir = resolve_lora_dir()
     os.makedirs(LOG_DIR, exist_ok=True)
     ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     with open(LOG_FILE, "a", encoding="utf-8") as f:
         f.write(f"\n\n{'=' * 70}\n")
-        f.write(f"会话开始：{ts}  模型：{MODEL_TAG}  权重：{LORA_DIR}\n")
+        f.write(f"会话开始：{ts}  模型：{MODEL_TAG}  权重：{lora_dir}\n")
         f.write(f"{'=' * 70}\n")
     print(f"对话日志：{LOG_FILE}", flush=True)
 

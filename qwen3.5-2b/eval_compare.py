@@ -26,6 +26,7 @@ import json
 import math
 import re
 import time
+import argparse
 from pathlib import Path
 from collections import Counter
 
@@ -39,12 +40,14 @@ import win_safetensors_patch
 win_safetensors_patch.apply()
 
 MODEL_DIR   = r"D:\LLM\models\qwen3.5-2b"
-LORA_DIR    = r"D:\LLM\models\qwen3.5-2b\unsloth_output\final"
-TEST_FILE   = r"D:\LLM\models\qwen3.5-2b\fl_test.jsonl"
 OUTPUT_DIR  = r"D:\LLM\models\qwen3.5-2b\unsloth_output"
+DEFAULT_LORA_DIR = os.path.join(OUTPUT_DIR, "final")
+LATEST_LORA_FILE = os.path.join(OUTPUT_DIR, "latest_lora_dir.txt")
+TEST_FILE   = r"D:\LLM\models\qwen3.5-2b\fl_test.jsonl"
 RESULT_FILE = os.path.join(OUTPUT_DIR, "eval_results.json")
 MAX_NEW_TOKENS = 768
 NGRAM_N = 4
+SAMPLED_SEED = 3407
 
 SYSTEM_PROMPT = (
     "你是联邦学习与分布式机器学习领域的专业研究员，"
@@ -83,7 +86,7 @@ def encode_prompt(tok, question: str) -> dict:
     return text_tok(text, return_tensors="pt")
 
 
-def generate_answer(model, tok, question: str) -> str:
+def generate_answer(model, tok, question: str, decode_config: dict) -> str:
     inputs = encode_prompt(tok, question)
     inputs = {k: v.to(model.device) for k, v in inputs.items()}
     text_tok = get_text_tokenizer(tok)
@@ -91,8 +94,8 @@ def generate_answer(model, tok, question: str) -> str:
         out = model.generate(
             **inputs,
             max_new_tokens=MAX_NEW_TOKENS,
-            do_sample=False,
             pad_token_id=text_tok.eos_token_id,
+            **decode_config,
         )
     return text_tok.decode(
         out[0, inputs["input_ids"].shape[1]:], skip_special_tokens=True,
@@ -159,24 +162,53 @@ def avg_metrics(rows: list[dict], key: str, category: str | None = None) -> floa
     return sum(vals) / len(vals) if vals else None
 
 
-def load_model():
+def resolve_lora_dir() -> str:
+    env_dir = os.environ.get("LORA_DIR")
+    if env_dir:
+        return env_dir
+    if os.path.isfile(LATEST_LORA_FILE):
+        latest = Path(LATEST_LORA_FILE).read_text(encoding="utf-8").strip()
+        if latest:
+            return latest
+    return DEFAULT_LORA_DIR
+
+
+def summarize(rows: list[dict]) -> dict:
+    return {
+        "ppl_avg": round(avg_metrics(rows, "ppl") or 0, 2),
+        "ppl_domain": round(avg_metrics(rows, "ppl", "领域") or 0, 2),
+        "ppl_general": round(avg_metrics(rows, "ppl", "通用") or 0, 2),
+        "length_avg": round(avg_metrics(rows, "length") or 0, 1),
+        "keyword_hit_avg": round(avg_metrics(rows, "keyword_hit", "领域") or 0, 3),
+        "repetition_avg": round(avg_metrics(rows, "repetition") or 0, 4),
+    }
+
+
+def save_results(result: dict) -> None:
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
+    with open(RESULT_FILE, "w", encoding="utf-8") as f:
+        json.dump(result, f, ensure_ascii=False, indent=2)
+    print(f"  已保存当前评估结果：{RESULT_FILE}", flush=True)
+
+
+def load_model(lora_dir: str):
     if not torch.cuda.is_available():
         sys.exit("无 CUDA。")
-    if not os.path.isdir(LORA_DIR):
-        sys.exit(f"未找到 LoRA：{LORA_DIR}，请先运行 unsloth_train.py")
+    if not os.path.isdir(lora_dir):
+        sys.exit(f"未找到 LoRA：{lora_dir}，请先运行 unsloth_train.py")
 
     print("加载模型...", flush=True)
     model, tok = FastLanguageModel.from_pretrained(
         model_name=MODEL_DIR, max_seq_length=4096,
         dtype=None, load_in_4bit=True, full_finetuning=False,
     )
-    model = PeftModel.from_pretrained(model, LORA_DIR)
+    model = PeftModel.from_pretrained(model, lora_dir)
     FastLanguageModel.for_inference(model)
     model.eval()
     return model, tok
 
 
-def run_variant(model, tok, samples: list[dict], use_lora: bool) -> list[dict]:
+def run_variant(model, tok, samples: list[dict], use_lora: bool, decode_name: str, decode_config: dict) -> list[dict]:
     tag = "lora" if use_lora else "base"
     if use_lora:
         model.base_model.enable_adapter_layers()
@@ -190,14 +222,16 @@ def run_variant(model, tok, samples: list[dict], use_lora: bool) -> list[dict]:
         kw = s.get("keywords", [])
         cat = s.get("category", "领域")
 
-        print(f"  [{tag}] {i}/{len(samples)} {q[:40]}...", flush=True)
+        print(f"  [{tag}/{decode_name}] {i}/{len(samples)} {q[:40]}...", flush=True)
         t0 = time.time()
-        pred = generate_answer(model, tok, q)
+        pred = generate_answer(model, tok, q, decode_config)
         gen_sec = time.time() - t0
         ppl = compute_ppl(model, tok, q, ref) if ref else None
 
         rows.append({
             "id": i,
+            "variant": tag,
+            "decode": decode_name,
             "category": cat,
             "question": q,
             "reference": ref,
@@ -213,55 +247,78 @@ def run_variant(model, tok, samples: list[dict], use_lora: bool) -> list[dict]:
 
 
 def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--decode",
+        choices=["greedy", "sampled", "both"],
+        default="greedy",
+        help="选择评估解码方式；默认只跑 greedy，both 会依次跑 greedy 和 sampled",
+    )
+    args = parser.parse_args()
+
     samples = load_jsonl(TEST_FILE)
     print(f"测试集 {len(samples)} 条", flush=True)
 
-    model, tok = load_model()
+    torch.manual_seed(SAMPLED_SEED)
+    lora_dir = resolve_lora_dir()
+    model, tok = load_model(lora_dir)
 
-    print("\n=== 基座模型（LoRA 关闭）===", flush=True)
-    base_rows = run_variant(model, tok, samples, use_lora=False)
-
-    print("\n=== LoRA 模型 ===", flush=True)
-    lora_rows = run_variant(model, tok, samples, use_lora=True)
-
-    summary = {
-        "base": {
-            "ppl_avg": round(avg_metrics(base_rows, "ppl") or 0, 2),
-            "ppl_domain": round(avg_metrics(base_rows, "ppl", "领域") or 0, 2),
-            "ppl_general": round(avg_metrics(base_rows, "ppl", "通用") or 0, 2),
-            "length_avg": round(avg_metrics(base_rows, "length") or 0, 1),
-            "keyword_hit_avg": round(avg_metrics(base_rows, "keyword_hit", "领域") or 0, 3),
-            "repetition_avg": round(avg_metrics(base_rows, "repetition") or 0, 4),
-        },
-        "lora": {
-            "ppl_avg": round(avg_metrics(lora_rows, "ppl") or 0, 2),
-            "ppl_domain": round(avg_metrics(lora_rows, "ppl", "领域") or 0, 2),
-            "ppl_general": round(avg_metrics(lora_rows, "ppl", "通用") or 0, 2),
-            "length_avg": round(avg_metrics(lora_rows, "length") or 0, 1),
-            "keyword_hit_avg": round(avg_metrics(lora_rows, "keyword_hit", "领域") or 0, 3),
-            "repetition_avg": round(avg_metrics(lora_rows, "repetition") or 0, 4),
+    all_decode_configs = {
+        "greedy": {"do_sample": False},
+        "sampled": {
+            "do_sample": True,
+            "temperature": 0.7,
+            "top_p": 0.9,
+            "repetition_penalty": 1.1,
         },
     }
+    decode_configs = (
+        all_decode_configs
+        if args.decode == "both"
+        else {args.decode: all_decode_configs[args.decode]}
+    )
 
+    results = {}
+    summary = {}
     result = {
         "meta": {
             "test_file": TEST_FILE,
-            "lora_dir": LORA_DIR,
-            "decode": "greedy (do_sample=False)",
+            "lora_dir": lora_dir,
+            "requested_decode": args.decode,
+            "completed_decodes": [],
+            "decode_configs": decode_configs,
             "max_new_tokens": MAX_NEW_TOKENS,
+            "sampled_seed": SAMPLED_SEED,
             "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
         },
         "summary": summary,
-        "base": base_rows,
-        "lora": lora_rows,
+        **results,
     }
 
-    os.makedirs(OUTPUT_DIR, exist_ok=True)
-    with open(RESULT_FILE, "w", encoding="utf-8") as f:
-        json.dump(result, f, ensure_ascii=False, indent=2)
+    for decode_name, decode_config in decode_configs.items():
+        print(f"\n=== 基座模型（LoRA 关闭）| {decode_name} ===", flush=True)
+        base_rows = run_variant(model, tok, samples, use_lora=False, decode_name=decode_name, decode_config=decode_config)
+        print(f"\n=== LoRA 模型 | {decode_name} ===", flush=True)
+        lora_rows = run_variant(model, tok, samples, use_lora=True, decode_name=decode_name, decode_config=decode_config)
+        results[f"base_{decode_name}"] = base_rows
+        results[f"lora_{decode_name}"] = lora_rows
+        summary[f"base_{decode_name}"] = summarize(base_rows)
+        summary[f"lora_{decode_name}"] = summarize(lora_rows)
+        result[f"base_{decode_name}"] = base_rows
+        result[f"lora_{decode_name}"] = lora_rows
+        result["meta"]["completed_decodes"].append(decode_name)
+        result["meta"]["timestamp"] = time.strftime("%Y-%m-%d %H:%M:%S")
+        save_results(result)
+
     print(f"\n评估结果已保存：{RESULT_FILE}", flush=True)
-    print(f"  基座 PPL={summary['base']['ppl_avg']} | LoRA PPL={summary['lora']['ppl_avg']}", flush=True)
-    print(f"  基座关键词命中={summary['base']['keyword_hit_avg']} | LoRA={summary['lora']['keyword_hit_avg']}", flush=True)
+    for decode_name in result["meta"]["completed_decodes"]:
+        print(
+            f"  {decode_name} 基座 PPL={summary[f'base_{decode_name}']['ppl_avg']} "
+            f"| LoRA PPL={summary[f'lora_{decode_name}']['ppl_avg']} "
+            f"| 基座关键词={summary[f'base_{decode_name}']['keyword_hit_avg']} "
+            f"| LoRA关键词={summary[f'lora_{decode_name}']['keyword_hit_avg']}",
+            flush=True,
+        )
 
 
 if __name__ == "__main__":

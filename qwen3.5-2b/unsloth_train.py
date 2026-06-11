@@ -33,12 +33,14 @@ from unsloth.chat_templates import train_on_responses_only
 import sys
 import json
 import time
+import hashlib
 import argparse
 from pathlib import Path
 
 import torch
 from datasets import Dataset
 from trl import SFTTrainer, SFTConfig
+from transformers import EarlyStoppingCallback, set_seed
 
 sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
@@ -54,7 +56,7 @@ MODEL_DIR  = r"D:\LLM\models\qwen3.5-2b"
 TRAIN_FILE = r"D:\LLM\models\FL_question.jsonl"
 TEST_FILE  = r"D:\LLM\models\qwen3.5-2b\fl_test.jsonl"
 OUTPUT_DIR = r"D:\LLM\models\qwen3.5-2b\unsloth_output"
-FINAL_DIR  = os.path.join(OUTPUT_DIR, "final")
+LATEST_LORA_FILE = os.path.join(OUTPUT_DIR, "latest_lora_dir.txt")
 
 # ══════════════════════════════════════════════════════════════════════
 #  超参数（含防遗忘配置说明）
@@ -66,12 +68,12 @@ MAX_SEQ_LENGTH = 1280      # 答案约 300 字（≈450 token）+ 提示，1280 
 # 防遗忘要点2：r 与 alpha 取相同值（缩放系数=1），更新幅度温和，不强行覆盖原分布
 LORA_R        = 16
 LORA_ALPHA    = 16
-LORA_DROPOUT  = 0.05       # 轻微 dropout，抑制对小数据集的过拟合
+LORA_DROPOUT  = 0.10       # 小数据集提高 dropout，降低死记硬背
 
 # —— 训练配置 ——
 # 防遗忘要点3：少轮次 + 低学习率 + cosine 衰减 + warmup，避免在 125 条小样本上过拟合
-NUM_EPOCHS          = 2
-LEARNING_RATE       = 1e-4
+NUM_EPOCHS          = 4        # 配合 early stopping，允许多看几轮但不强制跑满
+LEARNING_RATE       = 5e-5
 WARMUP_RATIO        = 0.10
 WEIGHT_DECAY        = 0.01     # 正则化，约束权重漂移
 BATCH_SIZE          = 1
@@ -80,6 +82,9 @@ GRAD_ACCUM          = 8        # 等效 batch = 8
 NEFTUNE_ALPHA       = 5
 SEED                = 3407
 VAL_RATIO           = 0.10     # 留 10% 作验证集，训练中跟踪 eval_loss
+EARLY_STOP_PATIENCE = 2        # eval_loss 连续 2 次不改善即停止
+SAVE_TOTAL_LIMIT    = 3        # 限制 checkpoint 数量，避免输出目录膨胀
+PREVIEW_SAMPLES     = 2        # 训练前打印少量渲染样本，检查模板是否正确
 
 SYSTEM_PROMPT = (
     "你是联邦学习与分布式机器学习领域的专业研究员，"
@@ -130,6 +135,75 @@ def build_dataset(tokenizer, samples: list[dict]) -> Dataset:
     return Dataset.from_dict({"text": texts})
 
 
+def sha256_file(path: str) -> str:
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1024 * 1024), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def print_dataset_diagnostics(tokenizer, dataset: Dataset) -> None:
+    if len(dataset) == 0:
+        sys.exit("训练集为空：没有可用的 instruction/output 样本。")
+    text_tok = getattr(tokenizer, "tokenizer", tokenizer)
+    lengths = [len(text_tok(x["text"], add_special_tokens=False)["input_ids"]) for x in dataset]
+    lengths_sorted = sorted(lengths)
+    p95 = lengths_sorted[min(len(lengths_sorted) - 1, int(len(lengths_sorted) * 0.95))]
+    too_long = sum(1 for n in lengths if n > MAX_SEQ_LENGTH)
+    print(
+        f"  token长度 min/avg/p95/max = {min(lengths)}/{sum(lengths)/len(lengths):.1f}/{p95}/{max(lengths)}",
+        flush=True,
+    )
+    if too_long:
+        print(f"  ⚠ {too_long} 条样本超过 MAX_SEQ_LENGTH={MAX_SEQ_LENGTH}，训练时会被截断。", flush=True)
+    for i in range(min(PREVIEW_SAMPLES, len(dataset))):
+        preview = dataset[i]["text"].replace("\n", "\\n").strip()
+        print(f"  样本预览[{i + 1}]: {preview[:500]}", flush=True)
+
+
+def assert_response_labels(trainer) -> None:
+    batch = next(iter(trainer.get_train_dataloader()))
+    labels = batch.get("labels")
+    if labels is None:
+        sys.exit("训练 batch 中没有 labels，无法确认 response-only loss mask。")
+    total = labels.numel()
+    trainable = int((labels != -100).sum().item())
+    if trainable == 0:
+        sys.exit("response-only mask 后没有任何 assistant token 参与训练，请检查 chat template 标记。")
+    print(f"  label mask 检查通过：{trainable}/{total} tokens 参与 loss", flush=True)
+
+
+def save_run_config(run_dir: str, train_count: int, eval_count: int, eval_steps: int) -> None:
+    os.makedirs(run_dir, exist_ok=True)
+    cfg = {
+        "model_dir": MODEL_DIR,
+        "train_file": TRAIN_FILE,
+        "test_file": TEST_FILE,
+        "train_sha256": sha256_file(TRAIN_FILE),
+        "train_count": train_count,
+        "eval_count": eval_count,
+        "max_seq_length": MAX_SEQ_LENGTH,
+        "lora_r": LORA_R,
+        "lora_alpha": LORA_ALPHA,
+        "lora_dropout": LORA_DROPOUT,
+        "num_epochs": NUM_EPOCHS,
+        "learning_rate": LEARNING_RATE,
+        "warmup_ratio": WARMUP_RATIO,
+        "weight_decay": WEIGHT_DECAY,
+        "batch_size": BATCH_SIZE,
+        "grad_accum": GRAD_ACCUM,
+        "effective_batch": BATCH_SIZE * GRAD_ACCUM,
+        "neftune_alpha": NEFTUNE_ALPHA,
+        "seed": SEED,
+        "val_ratio": VAL_RATIO,
+        "eval_steps": eval_steps,
+        "early_stop_patience": EARLY_STOP_PATIENCE,
+    }
+    with open(os.path.join(run_dir, "run_config.json"), "w", encoding="utf-8") as f:
+        json.dump(cfg, f, ensure_ascii=False, indent=2)
+
+
 # ══════════════════════════════════════════════════════════════════════
 #  主流程
 # ══════════════════════════════════════════════════════════════════════
@@ -137,6 +211,11 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--eval", action="store_true", help="训练后用测试集做推理对比")
     args = parser.parse_args()
+
+    set_seed(SEED)
+    run_name = time.strftime("run_%Y%m%d_%H%M%S")
+    run_dir = os.path.join(OUTPUT_DIR, run_name)
+    final_dir = os.path.join(run_dir, "final")
 
     if not torch.cuda.is_available():
         sys.exit("无 CUDA，请检查 GPU 驱动与 PyTorch 安装。")
@@ -177,6 +256,7 @@ def main():
     samples = load_jsonl(TRAIN_FILE)
     print(f"  共 {len(samples)} 条原始样本", flush=True)
     full_dataset = build_dataset(tokenizer, samples)
+    print_dataset_diagnostics(tokenizer, full_dataset)
     # 留出 10% 作验证集，训练时跟踪 eval_loss，量化监控过拟合/遗忘
     split = full_dataset.train_test_split(test_size=VAL_RATIO, seed=SEED)
     train_dataset, eval_dataset = split["train"], split["test"]
@@ -185,6 +265,7 @@ def main():
     # 验证集评估频率：每 EVAL_EVERY 个优化步评估一次
     steps_per_epoch = max(1, len(train_dataset) // (BATCH_SIZE * GRAD_ACCUM))
     eval_steps = max(1, steps_per_epoch // 2)
+    save_run_config(run_dir, len(train_dataset), len(eval_dataset), eval_steps)
 
     # ── 4. 配置 Trainer ─────────────────────────────────────────────
     trainer = SFTTrainer(
@@ -209,11 +290,17 @@ def main():
             eval_strategy               = "steps",
             eval_steps                  = eval_steps,
             seed                        = SEED,
-            output_dir                  = OUTPUT_DIR,
-            save_strategy               = "no",
+            output_dir                  = run_dir,
+            save_strategy               = "steps",
+            save_steps                  = eval_steps,
+            save_total_limit            = SAVE_TOTAL_LIMIT,
+            load_best_model_at_end      = True,
+            metric_for_best_model       = "eval_loss",
+            greater_is_better           = False,
             report_to                   = "none",
             dataset_num_proc            = 1,   # Windows 必须单进程
         ),
+        callbacks=[EarlyStoppingCallback(early_stopping_patience=EARLY_STOP_PATIENCE)],
     )
 
     # ── 5. 只对「助手回答」部分计算 loss（不学习提示）──────────────────
@@ -224,6 +311,7 @@ def main():
         instruction_part = "<|im_start|>user\n",
         response_part    = "<|im_start|>assistant\n",
     )
+    assert_response_labels(trainer)
 
     # ── 6. 训练 ─────────────────────────────────────────────────────
     print("\n=== 开始训练 ===", flush=True)
@@ -235,11 +323,14 @@ def main():
     print(f"\n训练完成，耗时 {elapsed/60:.1f} 分钟", flush=True)
     print(f"  最终 loss: {stats.training_loss:.4f}", flush=True)
 
-    # ── 7. 保存 LoRA 权重 ───────────────────────────────────────────
-    os.makedirs(FINAL_DIR, exist_ok=True)
-    model.save_pretrained(FINAL_DIR)
-    tokenizer.save_pretrained(FINAL_DIR)
-    print(f"LoRA 权重已保存到：{FINAL_DIR}", flush=True)
+    # ── 7. 保存最佳 LoRA 权重 ───────────────────────────────────────
+    os.makedirs(final_dir, exist_ok=True)
+    model.save_pretrained(final_dir)
+    tokenizer.save_pretrained(final_dir)
+    with open(LATEST_LORA_FILE, "w", encoding="utf-8") as f:
+        f.write(final_dir)
+    print(f"最佳 LoRA 权重已保存到：{final_dir}", flush=True)
+    print(f"最新 LoRA 指针已写入：{LATEST_LORA_FILE}", flush=True)
 
     # ── 7.1 保存 train/eval loss 曲线（供可视化看板使用）──────────────
     history = []
@@ -251,7 +342,7 @@ def main():
                 "loss":      rec.get("loss"),
                 "eval_loss": rec.get("eval_loss"),
             })
-    loss_path = os.path.join(OUTPUT_DIR, "loss_history.json")
+    loss_path = os.path.join(run_dir, "loss_history.json")
     with open(loss_path, "w", encoding="utf-8") as f:
         json.dump(history, f, ensure_ascii=False, indent=2)
     print(f"loss 曲线已保存到：{loss_path}", flush=True)
